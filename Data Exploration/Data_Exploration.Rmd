@@ -1,0 +1,454 @@
+---
+title: "IDS 570 - Data Exploration"
+author: "Tiye Ngachoko"
+date: "2026-10-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tidytext)
+library(quanteda)
+library(quanteda.textstats)
+library(tibble)
+library(ggplot2)
+```
+
+```{r load_texts}
+text_dir <- "C:/Users/titin/OneDrive - Duke University/TAD/Data Exploration/Text Files/"
+
+files <- list.files(text_dir, pattern = "\\.txt$", full.names = TRUE)
+
+texts <- tibble(
+  doc_id = str_remove(basename(files), "\\.txt$"),
+  text   = vapply(files, read_file, character(1))
+)
+
+texts
+```
+
+
+```{r}
+texts %>%
+  mutate(long_s = str_count(text, "ſ"),
+         illegible = str_count(text, "●")) %>%
+  select(doc_id, long_s, illegible) %>%
+  filter(long_s > 0 | illegible > 0)
+```
+- only circle of commerce has odd s that needs fixing.
+
+
+```{r}
+texts_clean <- texts %>%
+  mutate(
+    text = if_else(doc_id == "A07594__Circle_of_Commerce",
+                   str_replace_all(text, "ſ", "s"),
+                   text),
+    text = str_replace_all(text, "●", "") # marker appears in 14 texts
+  )
+
+texts_clean %>%
+  summarise(long_s = sum(str_count(text, "ſ")),
+            illegible = sum(str_count(text, "●")))
+
+```
+
+
+```{r}
+data("stop_words")
+
+custom_stop <- tibble(
+  word = c("vnto","haue","doo","hath","bee","ye","thee","hee","shall","hast",
+           "doe","beene","thereof","thus")
+)
+
+all_stopwords <- bind_rows(stop_words, custom_stop) %>%
+  distinct(word)
+
+words_clean <- texts_clean %>%
+  unnest_tokens(word, text) %>%
+  filter(!str_detect(word, "[0-9]")) %>%
+  anti_join(all_stopwords, by = "word")
+```
+
+
+
+## 0 - Normalization
+
+The long s appeared only in the Circle of Commerce text (4,517 instances), so I replaced it with "s" in that text alone, so that words like "sonne" would not be interpreted differently in just that one text. I also removed the "●" character from all texts. It is the EEBO transcription marker for illegible characters, and it appeared in 14 of the 23 texts; left in, it breaks words into meaningless fragments. I did not normalize other spelling variation, like u/v and i/j ("giue," "vpon"). While this may help in some cases, it risks replacing the wrong letters in words that are already spelled correctly. The trade-off is that older-spelling texts may look lexically distinctive in TF-IDF, or cluster together in the correlations, because of spelling rather than content. Lastly, I tokenized the texts, removed the standard tidytext stopword list along with the Early Modern function words from the Week 04 tutorial ("vnto," "haue," "hath," "thereof," etc.), and dropped tokens containing digits (page numbers, dates and sums of money). The cleaned documents vary greatly in length, from 864 tokens (A32830) to 127,435 (Smith's Wealth of Nations), which is something that stands out after the past few homework assignments.
+
+
+
+```{r}
+dfm_counts <- words_clean %>%
+  count(doc_id, word) %>%
+  cast_dfm(doc_id, word, n)
+
+dfm_counts
+```
+
+```{r}
+dfm_tfidf_w <- dfm_tfidf(dfm_counts)
+dfm_tfidf_w
+```
+
+
+```{r}
+tfidf_mat <- as.matrix(dfm_tfidf_w)
+
+top_tfidf <- lapply(rownames(tfidf_mat), function(doc) {
+  top <- sort(tfidf_mat[doc, ], decreasing = TRUE)[1:13]
+  tibble(doc_id = doc, term = names(top), tfidf = round(unname(top), 2))
+}) %>%
+  bind_rows()
+
+top_tfidf_table <- top_tfidf %>%
+  group_by(doc_id) %>%
+  summarise(top_terms = paste(term, collapse = ", "))
+
+knitr::kable(top_tfidf_table, caption = "Top 13 TF-IDF terms by doc")
+
+write_csv(top_tfidf, "top_tfidf_terms_DE.csv")
+```
+
+## Approach 1 : TF-IDF
+
+Several documents share distinctive vocabulary, which groups the corpus into clear clusters. A32827 and A32833 share 11 of their 13 top terms (plantations, abatement, cent, usury, newfoundland,), which supports they are two related texts, or perhaps even two editions of the same text. A32836 and A50763 are nearly identical too(poor, parish, fathers, hospitals, elected). A32839, A69858 and A32838 share vocabulary related to India/South Asia and trade (india, surrat, bombay, bengall, company, charter), while A06785, A06788, A06789 and A06791 share language about currency and exchange (moneys, exchange, realm, starlin, doller, stivers). 
+
+Some other top terms are names: "misselden" in A06785, "malynes" in Circle of Commerce. This shows these texts also refer to specific people relevant to economics and trade, etc. Most distinctive terms are either technical (units/amounts of money like starlin, carrats and grains) or topical (India, plantations, wool and cloth), with A06790 standing out from the rest of the corpus with vocabulary like monster, dragon, moon, visions and hell, which looks more like a fantasy narrative than terms indicative of the study or applications of economics. Still, some distinctiveness is driven by spelling and formatting rather than content. Almost every top term for Circle of Commerce and Free Trade is an outdated spelling (vpon, owne, mony, forraine, sayd, gouernment, euery, selfe), which reflects the trade-off of not normalizing spelling in Step 0: these texts may share ideas with the rest of the corpus but look distinctive because of how they are spelled. 
+
+
+
+```{r}
+dfm_trimmed <- dfm_trim(dfm_counts, min_termfreq = 5)
+
+dfm_trimmed
+```
+
+
+```{r}
+# words removed by trimming
+removed <- setdiff(featnames(dfm_counts), featnames(dfm_trimmed))
+length(removed)
+
+# a random sample of those removed words
+set.seed(570)
+sample(removed, 40)
+
+# of the words KEPT, how many appear in only one document?
+kept_docfreq <- docfreq(dfm_trimmed)
+sum(kept_docfreq == 1)
+sum(kept_docfreq == 1) / nfeat(dfm_trimmed)
+```
+
+```{r}
+lost <- tibble(
+  doc_id = docnames(dfm_counts),
+  tokens_before = as.numeric(ntoken(dfm_counts)),
+  tokens_after  = as.numeric(ntoken(dfm_trimmed))
+) %>%
+  mutate(pct_removed = round(100 * (1 - tokens_after / tokens_before), 1)) %>%
+  arrange(desc(pct_removed))
+
+lost # which documents lost the most when rare words were removed
+```
+
+```{r pairwise_corr}
+# pairwise Pearson correlations between all documents
+sim_r <- textstat_simil(dfm_trimmed, margin = "documents", method = "correlation")
+
+# Convert similarity object to a matrix
+r_mat <- as.matrix(sim_r)
+
+# Take a quick look
+dim(r_mat)
+r_mat[1:5, 1:5]
+
+# rounding correlation for readability (see explanation below)
+r_mat <- round(r_mat, 3)
+```
+
+
+```{r}
+pairs <- as.data.frame(r_mat) %>%
+  rownames_to_column("doc_i") %>%
+  pivot_longer(-doc_i, names_to = "doc_j", values_to = "r") %>%
+  filter(doc_i < doc_j)
+
+pairs %>% arrange(desc(r)) %>% head(5)   # most similar
+pairs %>% arrange(r) %>% head(5)         # least similar
+```
+
+
+```{r}
+short_names <- c("A07594__Circle_of_Commerce" = "COC",
+                 "B14801__Free_Trade"         = "FreeTrade",
+                 "wealth"                     = "Wealth")
+
+r_short <- r_mat
+rownames(r_short) <- recode(rownames(r_short), !!!short_names)
+colnames(r_short) <- recode(colnames(r_short), !!!short_names)
+
+doc_order <- rownames(r_short)[hclust(as.dist(1 - r_short))$order]
+
+# Long format for ggplot
+heat_df <- as.data.frame(r_short) %>%
+  rownames_to_column("doc_i") %>% # First document in pair
+  pivot_longer(-doc_i, names_to = "doc_j", values_to = "r") %>% # Second document + correlation
+  mutate(doc_i = factor(doc_i, levels = doc_order),
+         doc_j = factor(doc_j, levels = doc_order))
+
+# create the heatmap
+ggplot(heat_df, aes(x = doc_j, y = doc_i, fill = r)) +
+  geom_tile() + # Create colored tiles
+  coord_fixed() + # Keep tiles square
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0 # Center color scale at 0
+  ) +
+  labs(title = "Pearson Correlation Between Documents (ordered by similarity)",
+       x = NULL,
+       y = NULL,
+       fill = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+ggsave("correlation_heatmap_DE.png", width = 9, height = 8)
+```
+
+
+## Approach 2: Pearson correlation
+
+Before computing correlations, I trimmed words that appeared fewer than 5 times in the corpus, which removed 15,635 of 22,793 unique words, about 69%, and reduced sparsity from 88.58% to 75.90%. A random sample of 40 removed words was roughly split: about half were modern English words that are rare in this corpus ("combustible," "olive," "umpire"), while the rest were alternate or more archaic spellings ("multiplicitie," "sicke," "overbeareth"), non-English words like "humano", place names like "campeche" and an error, "things.colleg". After trimming, 88% of the remaining words appeared in at least two documents. Trimming did not affect all documents equally: the median document lost ~7% of its words, but Free Trade (22.9%), Circle of Commerce (20.6%) and A06790 (19.3%) lost about three times as much.
+
+All correlations were positive, ranging from 0.041 to ~1.000, so every text shares at least some vocabulary with every other. The two most similar pairs were A32827 and A32833 (r = 1.000) and A32836 and A50763 (r = 0.979), the same pairs TF-IDF showed sharing nearly identical distinctive terms. A correlation of 1.000 means their word use is essentially identical, which further supports they are two versions of the same text. The two least similar pairs were A32830 and A93819 (r = 0.041) and A06791 and A93819 (r = 0.045). All five of the lowest correlations involved A93819, placing as an outlier within this specific corpus.Ordered by similarity, the heatmap shows blocks that mostly match the TF-IDF results: money and exchange (A06785, A06786, A06788, A06789), India and trade (A32838, A32839, A69858). Circle of Commerce and Free Trade sit together, likely in part because of their shared older spelling.
+
+Some questions raised:
+- Are Circle of Commerce and Free Trade similar because of shared ideas, or just shared words spellings? Normalizing their spellings and re-running the correlations would help clarify this. 
+- Since A32827 and A32833 are almost duplicates, do they skew our corpus significantly, especially when calculated TF-IDF? 
+- Does A93819 belong in this corpus? It was the most outliing text in terms of least correlated documents. Is it connected to the others beyond what just vocabulary can show?
+
+
+
+
+```{r}
+library(udpipe)
+library(purrr)
+
+```
+
+
+```{r}
+texts_df <- texts_clean %>%
+  filter(doc_id %in% c("A32836", "A50763", "A32830", "A93819")) %>%
+  rename(document = doc_id) %>%
+  mutate(pair = if_else(document %in% c("A32836", "A50763"),
+                        "Most similar (r = 0.979)",
+                        "Least similar (r = 0.041)"))
+
+texts_df %>%
+  mutate(n_words = str_count(text, "\\S+")) %>%
+  select(document, pair, n_words)
+```
+
+
+```{r}
+model_info <- udpipe_download_model(language = "english-ewt")
+ud_model <- udpipe_load_model(model_info$file_model)
+
+model_info$file_model
+```
+
+```{r parsing}
+anno_df <- texts_df %>%
+  mutate(
+    # Parse each text with the UD parser; set doc_id to our document name
+    anno = map2(text, document, ~ udpipe_annotate(ud_model, x = .x, doc_id = .y) %>%
+      as.data.frame())
+  ) %>%
+  # Keep only parsed annotations, then unnest into rows
+  select(pair, anno) %>%
+  unnest(anno) %>%
+  # Use the UD doc_id as our document label (and drop any duplicates cleanly)
+  rename(document = doc_id) %>%
+  # Select columns for syntactic analysis
+  select(
+    document,
+    pair,
+    paragraph_id,
+    sentence_id,
+    token_id,
+    token,
+    lemma,
+    upos,          # part of speech
+    feats,         # grammatical features (e.g., verb form)
+    head_token_id, # head of dependency relation
+    dep_rel        # dependency relation type
+  )
+
+anno_df %>%
+  group_by(document) %>%
+  summarise(sentences = n_distinct(paste(paragraph_id, sentence_id)),
+            tokens = n())
+```
+
+```{r}
+syntax_df <- anno_df %>%
+  mutate(
+    is_word = upos != "PUNCT", #<--is it a word (and not punctuation?)
+
+    # Is this an independent clause? finite verbs are proxy for indipendent clauses
+    is_clause = (upos %in% c("VERB", "AUX")) &
+                str_detect(coalesce(feats, ""), "VerbForm=Fin"),
+
+    # Dependent clause?
+    is_dep_clause = dep_rel %in% c(
+      "advcl", #adverbial clause
+      "ccomp", # clausal complement
+      "xcomp", #open clausal complement
+      "acl", #adnomial clause
+      "acl:relcl" #relative clause
+    ),
+
+    # Is this coordination? That is, does it use "and" "or" etc.?
+    is_coord = dep_rel %in% c("conj", "cc"),
+
+    # Nominal complexity: these relations make noun phrases more complex
+    is_complex_nominal = dep_rel %in% c(
+      "amod", # adjective modifier ("big cup")
+      "nmod", #nominal modifier ("cup of tea")
+      "compound", # compound ("lemon tea")
+      "appos" #apposition ("tea, my favorite!")
+    )
+  )
+
+syntax_df %>%
+  group_by(document) %>%
+  summarise(words = sum(is_word),
+            clauses = sum(is_clause),
+            dep_clauses = sum(is_dep_clause),
+            coord = sum(is_coord),
+            complex_nominals = sum(is_complex_nominal))
+
+
+```
+
+
+```{r}
+sentence_df <- syntax_df %>%
+  filter(is_word) %>%           #count words (not punctuation)
+  group_by(document, pair, paragraph_id, sentence_id) %>%   #group by document and sentence
+  summarise(
+    words          = n(),   #number of words per sentence
+    clauses        = sum(is_clause), # number of clauses per sentence
+    dep_clauses    = sum(is_dep_clause), #number of dependent clauses per sentence
+    .groups = "drop"
+  )
+
+doc_totals <- syntax_df %>%
+  group_by(document) %>%
+  summarise(coord = sum(is_coord),
+            complex_nominals = sum(is_complex_nominal),
+            .groups = "drop")
+
+# Combine all measures
+all_measures <- sentence_df %>%
+  group_by(document, pair) %>%
+  summarise(sentences = n(),
+            MLS = mean(words), # Average words per sentence
+            clauses = sum(clauses),
+            dep_clauses = sum(dep_clauses),
+            .groups = "drop") %>%
+  left_join(doc_totals, by = "document") %>%
+  mutate(C_per_S     = clauses / sentences, #Calculate clauses per sentence
+         DC_per_C    = dep_clauses / pmax(clauses, 1), #avoid division by 0 (shouldn't happen, but if no clauses were detected in the sentence, we still want it to run)
+         DC_per_S    = dep_clauses / sentences,
+         Coord_per_C = coord / pmax(clauses, 1),
+         Coord_per_S = coord / sentences,
+         CN_per_C    = complex_nominals / pmax(clauses, 1),
+         CN_per_S    = complex_nominals / sentences) %>%
+  select(pair, document, MLS, C_per_S, DC_per_C, DC_per_S,
+         Coord_per_C, Coord_per_S, CN_per_C, CN_per_S) %>%
+  arrange(pair, document)
+
+all_measures %>%
+  knitr::kable(
+    digits = 2,
+    col.names = c("Pair", "Document", "MLS", "C/S", "DC/C", "DC/S",
+                  "Coord/C", "Coord/S", "CN/C", "CN/S")
+  )
+write_csv(all_measures, "syntax_measures_DE.csv")
+```
+
+
+```{r}
+sentence_examples <- syntax_df %>%
+  group_by(document, paragraph_id, sentence_id) %>%
+  summarise(text = paste(token, collapse = " "),
+            words = sum(is_word),
+            clauses = sum(is_clause),
+            coord = sum(is_coord),
+            nominals = sum(is_complex_nominal),
+            .groups = "drop") %>%
+  filter(words >= 20, words <= 50, clauses >= 1) %>%
+  mutate(coord_per_clause = coord / clauses)
+
+# A93819: noun and coordination-heavy sentences
+sentence_examples %>%
+  filter(document == "A93819") %>%
+  slice_max(coord_per_clause, n = 3, with_ties = FALSE) %>%
+  select(words, clauses, coord, nominals, text)
+
+# A32830: clause-heavy sentences
+sentence_examples %>%
+  filter(document == "A32830") %>%
+  slice_max(clauses, n = 3, with_ties = FALSE) %>%
+  select(words, clauses, coord, nominals, text)
+```
+
+
+```{r}
+sentence_examples %>%
+  filter(document == "A93819") %>%
+  slice_max(coord_per_clause, n = 3, with_ties = FALSE) %>%
+  pull(text)
+
+sentence_examples %>%
+  filter(document == "A32830") %>%
+  slice_max(clauses, n = 3, with_ties = FALSE) %>%
+  pull(text)
+```
+
+
+## Approach 3: Syntactic complexity
+
+I compared two pairs chosen from Approach 2: the most similar (A32836 and A50763, r = 0.979) and the least similar (A32830 and A93819, r = 0.041), to see whether lexical similarity also shows up in how the texts are written. All four were parsed with udpipe's English-EWT model. Since it's trained on modern English, some parsing errors are likely to occur with the older texts.
+
+Sentence length was almost the same across all four texts (41.58–43.62 words). The most similar pair was also nearly identical syntactically (C/S 3.36 vs 3.27, DC/C 0.94 for both), which again supports them being versions of the same text. The least similar pair differed in how sentences are built intead of their length; A93819 had fewer clauses per sentence (2.67 vs 3.68) but more than twice the coordination per clause (2.33 vs 1.00) and nearly twice the complex nominals per clause (2.83 vs 1.44). Subordination was similar across all four texts (DC/C 0.84–0.94), partly because the dependent-clause count includes non-finite clauses, so it's better read as a comparison between texts than as an exact proportion.
+
+The example sentences show this difference. A93819: "William Bury, and John Bury, and Johanna Lowen, and their Wives, by Deed indented and enrolled in the Hustings in London, bargain and sell their parts of the Premises to Edmomd Wiseman and his Heirs.". "bargain and sell" is between a chain of names. A32830: "Suppose then the Merchant is forced to sell this Corn for only so much above the prime Cost, as he has expended in Charges, it may be 2000 l. in this Case, though the Merchant has gained nothing, yet it is plain the Kingdom has increased 2000 l." is clause heavy.
+
+These results align with the lexical findings: the pair that shared vocabulary also shared syntax, and the pair that shared almost none differed in structure. They also add context. A93819's list-like style and its vocabulary suggest it being a record rather than a narritive or argument, which may help explain why it's the outlier, while A32830 adds reasoning and examples.
+
+
+### Synthesis
+
+Central idea: Texts that share vocabulary in this corpus also tend to share sentence structure, so lexical and syntactic similarity, at least in this instance, are aligned
+
+Evidence from each approach:
+
+TF-IDF: A32836 and A50763 shared nearly identical distinctive words, while A93819's words were unlike the rest of the corpus.
+Correlation: A32836 and A50763 were the second most similar pair (r = 0.979), and A93819 was in all five least similar pairs.
+Syntax: A32836 and A50763 had nearly identical profiles, while A93819 and A32830 differed in structure: A93819 was list-like and noun-heavy, and A32830 was clause-heavy.
+
+Limitations: TF-IDF and correlation were both affected by spelling variation and by near-duplicate texts, and the parser is trained on modern English. I also only compared four texts syntactically, so this pattern would need to be tested on more of the corpus to make a greater argument.
